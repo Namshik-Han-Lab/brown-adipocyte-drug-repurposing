@@ -18,6 +18,7 @@ This repository contains all computational scripts used in the above manuscript.
 
 ## Repository structure
 
+```
 scripts/
 ├── snRNAseq/
 │   └── 01_snRNAseq_PVAT_analysis.Rmd
@@ -34,6 +35,7 @@ scripts/
 └── in_vitro/
     └── 01_extract_in_vitro_validation_drug_targets.R
     └── [to be added]
+```
 
 ---
 
