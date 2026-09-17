@@ -4,9 +4,9 @@ Code repository for:
 
 **An amyloid-β/APP regulatory layer in human brown adipocyte recruitment nominates repurposable drugs for thermogenic fat expansion**
 
-*Authors: to be added upon publication*
+Hannah Mia Lyubov Bazin\*, Sonia Rodríguez-Fdez\*, Fatima Baldo\*, Iman D. Mali, Nazuk Gupta, Milidili Maimiti, Taylor Simonian, Mark Campbell, Namshik Han\*\*, Antonio Vidal-Puig\*\*
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+\*These authors contributed equally | \*\*Co-last authors
 
 ---
 
@@ -26,23 +26,27 @@ scripts/
 │   ├── 01_network_reformatting_PPI.Rmd
 │   ├── 02_network_reformatting_DPI.Rmd
 │   ├── 03_generate_PPI_DPI_gene_lists.ipynb
-│   ├── 04_drug_proximity_analysis_full_gene_lists.py
-│   ├── 05_drug_proximity_analysis_key_genes.ipynb
-│   ├── 06_extract_significant_drugs.ipynb
-│   └── 07_extract_significant_drug_targets.ipynb
+│   ├── 04_identify_key_genes.ipynb
+│   ├── 05_drug_proximity_analysis_full_gene_lists.py
+│   ├── 06_drug_proximity_analysis_key_genes.ipynb
+│   ├── 07_extract_significant_drugs.ipynb
+│   ├── 08_extract_significant_drug_targets.ipynb
+│   └── 09_classify_and_visualise_significant_drugs.ipynb
 ├── knowledge_graph/
-│   └── [to be added]
+│   └── 01_knowledge_graph_neo4j_queries.md
 └── in_vitro/
-    └── 01_extract_in_vitro_validation_drug_targets.R
-    └── [to be added]
+    ├── 01_extract_in_vitro_validation_drug_targets.R
+    └── 02_bulk_RNAseq_drug_treatment.Rmd
 ```
 
 ---
 
 ## Data availability
 
-Raw snRNA-seq data are publicly available from NCBI GEO:
-[GSE164528 – Defining the lineage of thermogenic perivascular adipose tissue](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE164528)
+Human PVAT snRNA-seq data are publicly available from NCBI GEO:
+[GSE164528](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE164528) (samples GSM5068996, GSM5068997, GSM5068998)
+
+Bulk RNA-seq data generated in this study are deposited in GEO: [GSE342095](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE342095)
 
 External databases used:
 - **STRING** v12.0: https://string-db.org
@@ -62,4 +66,4 @@ All analyses were run in **R (v4.4.1)** and **Python (v3.9.12)**. Python depende
 
 ## Acknowledgements
 
-snRNA-seq analysis builds on code originally developed by Holly A. R. Giles.
+snRNA-seq analysis builds on code originally developed by Holly A. R. Giles. We thank Nicholas M. Katritsis for helpful discussions and for critically reviewing and revising the manuscript.
