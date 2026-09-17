@@ -3,7 +3,7 @@
 # selected for experimental validation, and prepares input files for Cytoscape visualisation.
 
 ##### Set up
-# Set working directory: setwd("/Users/hannahbazin/Desktop/Cambridge/Academics/Han_Lab/MPhil/mphil-project")
+# Set working directory: setwd("...")
 library(tidyverse)
 
 #### Make list of in vitro validated drugs and targets

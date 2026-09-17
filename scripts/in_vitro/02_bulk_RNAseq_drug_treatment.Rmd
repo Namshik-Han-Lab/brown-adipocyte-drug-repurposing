@@ -1,0 +1,1460 @@
+---
+title: "BulkRNAseq"
+author: "Sonia Rodriguez"
+date: "2026-06-01"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+
+# Load libraries
+library(tximport)
+library(DESeq2)
+library(tidyverse)
+library(readxl)
+library(ggfortify)
+library(biomaRt)
+library(dplyr)
+library(readr)
+```
+
+## Tximport
+
+```{r}
+
+#ASSIGNING GENE IDS
+
+setwd("/Users/soniarodriguez/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Raw_data")
+
+library(rtracklayer)
+
+gtf <- rtracklayer::import("gencode.v44.annotation.gtf.gz")
+
+tx2gene <- data.frame(
+  TXNAME = gtf$transcript_id,
+  GENEID = gtf$gene_id
+)
+
+tx2gene <- unique(tx2gene)
+tx2gene <- tx2gene[!is.na(tx2gene$TXNAME), ]
+tx2gene <- tx2gene[!duplicated(tx2gene$TXNAME), ]
+tx2gene$TXNAME <- sub("\\..*$", "", tx2gene$TXNAME)
+
+head(tx2gene)
+
+
+cat("Number of unique transcripts in tx2gene:", length(unique(tx2gene$TXNAME)), "\n")
+cat("Number of unique genes in tx2gene:", length(unique(tx2gene$GENEID)), "\n")
+sum(is.na(tx2gene$TXNAME))
+
+```
+
+## Load Data/Txi object
+
+```{r}
+# READING ALL SUBFOLDERS AND CREATING METADATA
+
+setwd("/Users/soniarodriguez/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Raw_data")
+
+all_folders <- list.dirs("salmon_quant", recursive = FALSE, full.names = FALSE)
+
+sampleinfo <- data.frame(
+  ID = all_folders,
+  Batch = sub("^([^_]+)_.*$", "\\1", all_folders),
+  Day = ifelse(
+    grepl("_[Dd][0-9]+_", all_folders),
+    sub("^.*_([Dd][0-9]+)_.*$", "\\1", all_folders),
+    "D20"
+  ),
+  Treatment = sub("^.*_(C|P|S|SP)[0-9]*$", "\\1", all_folders),
+  Replicate = ifelse(
+    grepl("[0-9]+$", all_folders),
+    sub("^.*?([0-9]+)$", "\\1", all_folders),
+    NA
+  ),
+  stringsAsFactors = FALSE
+)
+
+files <- file.path("salmon_quant", sampleinfo$ID, "quant.sf")
+names(files) <- sampleinfo$ID
+
+stopifnot(all(file.exists(files)))
+
+qc_check_salmon_strict <- function(file) {
+
+  ok <- TRUE
+  msg <- character()
+
+  # 1. file size sanity
+  info <- file.info(file)
+  if (is.na(info$size) || info$size < 1e5) {
+    ok <- FALSE
+    msg <- c(msg, "file too small/suspicious")
+  }
+
+  # 2. detect NUL bytes properly (THIS was missing)
+  raw <- readBin(file, "raw", n = info$size)
+  if (any(raw == as.raw(0))) {
+    ok <- FALSE
+    msg <- c(msg, "embedded NUL bytes")
+  }
+
+  # 3. safe header parse
+  header <- tryCatch(
+    readLines(file, n = 1, warn = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(header)) {
+    ok <- FALSE
+    msg <- c(msg, "unreadable header")
+  }
+
+  # 4. column count check
+  if (!is.null(header)) {
+    cols <- strsplit(header, "\t", fixed = TRUE)[[1]]
+    if (length(cols) != 5) {
+      ok <- FALSE
+      msg <- c(msg, paste0("bad column count: ", length(cols)))
+    }
+  }
+
+  # 5. transcript count sanity (THIS catches your failures)
+  nlines <- tryCatch(
+    length(readLines(file, warn = FALSE)),
+    error = function(e) NA
+  )
+
+  if (!is.na(nlines)) {
+    if (nlines < 50000) {
+      ok <- FALSE
+      msg <- c(msg, paste0("too few rows: ", nlines))
+    }
+  }
+
+  data.frame(
+    file = file,
+    ok = ok,
+    message = paste(msg, collapse = "; ")
+  )
+}
+
+qc <- do.call(rbind, lapply(files, qc_check_salmon_strict))
+
+good_samples <- qc$file[qc$ok]
+bad_samples  <- qc$file[!qc$ok]
+
+good_samples
+bad_samples
+
+library(tximport)
+
+tximport_safe <- function(files, tx2gene, ...) {
+
+  # keep only good files
+  qc <- do.call(rbind, lapply(files, qc_check_salmon_strict))
+  files_ok <- files[qc$ok]
+
+  message("Using ", length(files_ok), " / ", length(files), " samples")
+
+  txi <- tximport(
+    files_ok,
+    type = "salmon",
+    txIn = TRUE,
+    txOut = FALSE,
+    tx2gene = tx2gene,
+    ignoreTxVersion = TRUE
+  )
+
+  return(list(
+    txi = txi,
+    qc = qc
+  ))
+}
+
+res <- tximport_safe(files, tx2gene)
+
+txi <- res$txi
+qc  <- res$qc
+
+qc
+
+names(txi)
+
+```
+
+## DESEq2 from tximport(salmon quant.sf files)
+
+```{r, eval = FALSE}
+
+# QUALITY CHECK
+
+# Convert metadata to factors
+sampleinfo$Batch      <- factor(sampleinfo$Batch)
+sampleinfo$Day        <- factor(sampleinfo$Day)
+sampleinfo$Treatment  <- factor(sampleinfo$Treatment)
+sampleinfo$Replicate  <- factor(sampleinfo$Replicate)
+
+# See how many levels each factor has
+sapply(sampleinfo[, c("Batch", "Day", "Treatment", "Replicate")], nlevels)
+
+# Look at your design variables
+summary(sampleinfo)
+
+# Check colinearity (design matrix structure)
+lm_check <- lm(
+  1:nrow(sampleinfo) ~ Batch + Day + Treatment + Replicate,
+  data = sampleinfo
+)
+
+# Check which coefficients are linearly dependent
+alias(lm_check)
+
+```
+
+```{r, eval = FALSE}
+
+# Build DESeq2 object
+
+
+ddsTxi <- DESeqDataSetFromTximport(
+ txi,
+ colData = sampleinfo,
+ design = ~ Treatment
+)
+# Verify object structure
+ddsTxi
+design(ddsTxi)
+colData(ddsTxi)
+
+```
+
+
+```{r, eval = FALSE}
+
+dim(ddsTxi)
+
+# filter the data
+# Keep genes that have counts > 1 in at least 20% of samples
+min_samples <- ceiling(0.20 * ncol(ddsTxi))
+genes_to_keep <- rownames(ddsTxi)[rowSums(counts(ddsTxi) > 1) >= min_samples]
+
+# Subset the DESeqDataSet
+ddsTxi <- ddsTxi[genes_to_keep, ]
+
+```
+
+```{r, eval = FALSE}
+
+# Save and normalise counts
+assay(ddsTxi, "vst", blind=TRUE, withDimnames = FALSE) <- vst(counts(ddsTxi))
+assay(ddsTxi, "counts") # raw counts
+counts(ddsTxi) 
+assay(ddsTxi, "vst") # normalised counts
+
+outfolder <- file.path(getwd(), "DEG_results")
+dir.create(outfolder, showWarnings = FALSE)
+  
+# Extract raw counts
+rawcts <- counts(ddsTxi) %>% 
+  as_tibble(rownames = "gene")
+write_csv(rawcts, "DEG_results/raw.csv")  
+
+# Extract VST-normalized counts
+vst_dds <- vst(ddsTxi, blind = TRUE)
+normcts <- assay(vst_dds) %>% 
+  as_tibble(rownames = "gene")
+write_csv(normcts, "DEG_results/normcts_vst.csv")
+
+```
+
+```{r, eval = FALSE}
+
+ library(org.Hs.eg.db)
+
+# Gene ID → SYMBOL mapping
+ensembl_ids <- sub("\\..*$", "", rownames(ddsTxi))
+
+gene_symbols <- mapIds(
+  org.Hs.eg.db,
+  keys = ensembl_ids,
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+head(gene_symbols)
+# store in DESeq object
+rowData(ddsTxi)$gene_symbol <- gene_symbols
+
+
+# Raw counts with gene symbols
+
+
+rawcts <- assay(ddsTxi, "counts") %>%
+  as_tibble(rownames = "ensembl_id") %>%
+  mutate(
+    ensembl_lookup = sub("\\..*$", "", ensembl_id),
+    gene_symbol = gene_symbols[ensembl_lookup]
+  ) %>%
+  dplyr::select(gene_symbol, everything(), -ensembl_lookup)
+
+write_csv(rawcts, "DEG_results/raw_gene_symbols.csv")
+
+
+# VST counts with gene symbols
+
+normcts <- assay(vst_dds) %>%
+  as_tibble(rownames = "ensembl_id") %>%
+  mutate(
+    ensembl_lookup = sub("\\..*$", "", ensembl_id),
+    gene_symbol = gene_symbols[ensembl_lookup]
+  ) %>%
+  dplyr::select(gene_symbol, everything(), -ensembl_lookup)
+
+write_csv(normcts, "DEG_results/vst_gene_symbols.csv")
+```
+
+```{r}
+
+############################################################
+# COMBINATION TREATMENT - FILTER SAMPLES (HT37 + HT39B and HT39C only)
+############################################################
+
+keep <- grepl("^HT37|^HT39", sampleinfo$ID)
+
+sampleinfo_syn <- sampleinfo[keep, ]
+dds_syn <- ddsTxi[, keep]
+
+############################################################
+# 1. FACTORS
+############################################################
+
+sampleinfo_syn$Batch <- factor(sub("_.*", "", sampleinfo_syn$ID))
+
+sampleinfo_syn$P <- factor(
+  ifelse(sampleinfo_syn$Treatment %in% c("P","SP"), "Yes", "No"),
+  levels = c("No","Yes")
+)
+
+sampleinfo_syn$S <- factor(
+  ifelse(sampleinfo_syn$Treatment %in% c("S","SP"), "Yes", "No"),
+  levels = c("No","Yes")
+)
+
+colData(dds_syn) <- S4Vectors::DataFrame(sampleinfo_syn)
+
+############################################################
+# 2. MODEL
+############################################################
+
+design(dds_syn) <- ~ Batch + P + S + P:S
+dds_syn <- DESeq(dds_syn)
+
+resultsNames(dds_syn)
+
+############################################################
+# 3. MAIN EFFECTS
+############################################################
+
+res_P <- results(dds_syn, name = "P_Yes_vs_No")
+res_S <- results(dds_syn, name = "S_Yes_vs_No")
+res_int <- results(dds_syn, name = "PYes.SYes")
+res_PS <- results(
+  dds_syn,
+  contrast = list(c("P_Yes_vs_No", "S_Yes_vs_No", "PYes.SYes"))
+)
+
+############################################################
+# 5. ADD GENE SYMBOLS
+############################################################
+
+add_symbol <- function(res, dds) {
+  res$gene_symbol <- rowData(dds)$gene_symbol[
+    match(rownames(res), rownames(dds))
+  ]
+  res
+}
+
+res_P   <- add_symbol(res_P, dds_syn)
+res_S   <- add_symbol(res_S, dds_syn)
+res_int <- add_symbol(res_int, dds_syn)
+res_PS  <- add_symbol(res_PS, dds_syn)
+
+############################################################
+# 6. SIGNIFICANCE TABLES
+############################################################
+
+sig_P   <- subset(res_P,   padj < 0.05 & !is.na(padj))
+sig_S   <- subset(res_S,   padj < 0.05 & !is.na(padj))
+sig_int <- subset(res_int, padj < 0.05 & !is.na(padj))
+sig_PS   <- subset(res_PS,   padj < 0.05 & !is.na(padj))
+
+############################################################
+# 7. COMBINED MASTER TABLE
+############################################################
+
+all_res <- data.frame(
+  gene = rownames(dds_syn),
+
+  log2FC_P   = res_P$log2FoldChange,
+  log2FC_S   = res_S$log2FoldChange,
+  log2FC_INT = res_int$log2FoldChange,
+  log2FC_PS  = res_PS$log2FoldChange,
+
+  padj_P   = res_P$padj,
+  padj_S   = res_S$padj,
+  padj_INT = res_int$padj,
+  padj_PS  = res_PS$padj,
+
+  symbol = rowData(dds_syn)$gene_symbol
+)
+
+
+############################################################
+# 8. CLASSIFICATION (BIOLOGICAL MECHANISM)
+############################################################
+
+all_res$class <- NA_character_
+
+# single effects
+all_res$class[
+  all_res$padj_P < 0.05 & all_res$padj_S >= 0.05 & all_res$padj_INT >= 0.05
+] <- "P_only"
+
+all_res$class[
+  all_res$padj_S < 0.05 & all_res$padj_P >= 0.05 & all_res$padj_INT >= 0.05
+] <- "S_only"
+
+# double effects
+all_res$class[
+  all_res$padj_PS < 0.05 & all_res$padj_P >= 0.05 & all_res$padj_S >= 0.05 & all_res$padj_INT >= 0.05
+] <- "PS_only"
+
+# additive (higher than combination)
+all_res$class[
+  all_res$padj_PS < 0.05  & all_res$log2FC_INT >= abs(0.3) & sign(all_res$log2FC_PS) == sign(all_res$log2FC_INT)
+] <- "additive"
+
+# interaction = synergy / antagonism
+all_res$class[
+  all_res$padj_INT < 0.05
+] <- "non_additive (interaction)"
+
+############################################################
+# 10. EXPORT
+############################################################
+
+write.csv(all_res, "DEG_results/full_mechanism_table.csv", row.names = FALSE)
+write.csv(res_P, "DEG_results/DEG_Phenserine.csv", row.names = FALSE)
+write.csv(res_S, "DEG_results/DEG_Sacubitril.csv", row.names = FALSE)
+write.csv(res_PS, "DEG_results/DEG_Sacubitril_Phenserine.csv", row.names = FALSE)
+write.csv(res_int, "DEG_results/DEG_interaction_genes.csv", row.names = FALSE)
+
+```
+
+```{r}
+# ----------------------------
+# PCA from VST
+# ----------------------------
+
+pca2 <- prcomp(t(assay(vst(dds_syn, blind = FALSE))))
+
+df2 <- data.frame(
+  sample = colnames(vst(dds_syn, blind = FALSE)),
+  PC1 = pca2$x[,1],
+  PC2 = pca2$x[,2],
+  PC3 = pca2$x[,3],
+  Treatment = sampleinfo_syn$Treatment,
+  Batch = sampleinfo_syn$Batch
+)
+
+df2$Treatment <- factor(df2$Treatment)
+df2$Batch <- factor(df2$Batch)
+
+
+# ----------------------------
+# PCA plot
+# ----------------------------
+ggplot(df2, aes(PC1, PC2, color = Treatment, shape = Batch)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "PCA: Synergy")
+
+```
+```{r}
+
+
+#############################################
+# EARLY MECHANISTIC INSIGHTS FOR SACUBITRIL #
+#############################################
+
+keep <- grepl("^HT4.*_D(14|20)_(C|S)", sampleinfo$ID)
+
+sampleinfo_Sac <- sampleinfo[keep, ]
+dds_Sac <- ddsTxi[, keep]
+
+############################################################
+# 1. FACTORS
+############################################################
+
+sampleinfo_Sac$Day <- factor(sampleinfo_Sac$Day)
+
+
+sampleinfo_Sac$Treatment <- factor(sampleinfo_Sac$Treatment)
+ 
+colData(dds_Sac) <- S4Vectors::DataFrame(sampleinfo_Sac)
+
+############################################################
+# 2. MODEL
+############################################################
+dds_Sac$Day <- relevel(dds_Sac$Day, ref = "D14")
+design(dds_Sac) <- ~ Day + Treatment + Day:Treatment
+dds_Sac <- DESeq(dds_Sac)
+
+resultsNames(dds_Sac)
+
+res_int_Sac <- results(dds_Sac, name = "DayD20.TreatmentS")
+res_int_Sac <- add_symbol(res_int_Sac, dds_Sac)
+
+write.csv(res_int_Sac, "DEG_results/DEG_S_Day_interaction.csv", row.names = FALSE)
+
+res_diff_Sac <- results(dds_Sac, name = "Day_D20_vs_D14")
+res_diff_Sac <- add_symbol(res_diff_Sac, dds_Sac)
+
+write.csv(res_diff_Sac, "DEG_results/DEG_D20_D14_S.csv", row.names = FALSE)
+
+res_comb_Sac <- results(dds_Sac, name = "Treatment_S_vs_C")
+res_comb_Sac <- add_symbol(res_comb_Sac, dds_Sac)
+
+write.csv(res_comb_Sac, "DEG_results/DEG_Sac_C_early.csv", row.names = FALSE)
+
+
+############################################################
+# 3. PCA from VST
+############################################################
+library(ggplot2)
+
+rownames(sampleinfo_Sac) <- sampleinfo_Sac$ID
+vsd_sac <- vst(dds_Sac, blind = TRUE)
+
+pca <- prcomp(t(assay(vsd_sac)))
+
+pve <- (pca$sdev^2) / sum(pca$sdev^2)
+
+pc1_lab <- paste0("PC1 (", round(100 * pve[1], 1), "%)")
+pc2_lab <- paste0("PC2 (", round(100 * pve[2], 1), "%)")
+
+df <- data.frame(
+  sample = colnames(vsd_sac),
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2],
+  PC3 = pca$x[,3],
+  Treatment = sampleinfo_Sac$Treatment,
+  Day = sampleinfo_Sac$Day
+)
+
+df$Treatment <- factor(df$Treatment)
+df$Day <- factor(df$Day)
+
+# PCA plot
+
+
+pc_s <- ggplot(df, aes(PC1, PC2, color = Treatment, shape = Day)) +
+  geom_point(size = 5) +
+  theme_minimal(base_size = 16) +
+  
+  labs(
+    title = "PCA: Sacubitril",
+    x = pc1_lab,
+    y = pc2_lab
+  )
+
+ggsave(
+  filename = file.path(
+    "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/Early",
+    "PCA_Sacubitril_Early.pdf"
+  ),
+  plot = pc_s,
+  width = 6,
+  height = 5
+)
+```  
+
+```{r}
+
+
+#############################################
+# EARLY MECHANISTIC INSIGHTS FOR PHENSERINE #
+#############################################
+
+keep <- grepl("^HT42", sampleinfo$ID)
+
+sampleinfo_Phen <- sampleinfo[keep, ]
+dds_Phen <- ddsTxi[, keep]
+
+############################################################
+# 1. FACTORS
+############################################################
+
+sampleinfo_Phen$Day <- factor(sampleinfo_Phen$Day)
+
+
+sampleinfo_Phen$Treatment <- factor(sampleinfo_Phen$Treatment)
+ 
+colData(dds_Phen) <- S4Vectors::DataFrame(sampleinfo_Phen)
+
+############################################################
+# 2. MODEL
+############################################################
+dds_Phen$Day <- relevel(dds_Phen$Day, ref = "D6")
+design(dds_Phen) <- ~ Day + Treatment + Day:Treatment
+dds_Phen <- DESeq(dds_Phen)
+
+resultsNames(dds_Phen)
+
+res_int_phen <- results(dds_Phen, name = "DayD14.TreatmentP")
+res_int_phen <- add_symbol(res_int_phen, dds_Phen)
+
+write.csv(res_int_phen, "DEG_results/DEG_P_D14_interaction.csv", row.names = FALSE)
+
+res_diff_phen <- results(dds_Phen, name = "Day_D14_vs_D6")
+res_diff_phen <- add_symbol(res_diff_phen, dds_Phen)
+
+write.csv(res_diff_phen, "DEG_results/DEG_D14_D6_P.csv", row.names = FALSE)
+
+res_comb_phen <- results(dds_Phen, name = "Treatment_P_vs_C")
+res_comb_phen <- add_symbol(res_comb_phen, dds_Phen)
+
+write.csv(res_comb_phen, "DEG_results/DEG_Phen_C_early.csv", row.names = FALSE)
+
+# ----------------------------
+# PCA from VST
+# ----------------------------
+library(ggplot2)
+
+rownames(sampleinfo_Phen) <- sampleinfo_Phen$ID
+vsd_phen <- vst(dds_Phen, blind = TRUE)
+#sampleinfo_Phen <-sampleinfo_Phen[colnames(vsd_phen), ]
+
+pca <- prcomp(t(assay(vsd_phen)))
+
+pve <- (pca$sdev^2) / sum(pca$sdev^2)
+
+pc1_lab <- paste0("PC1 (", round(100 * pve[1], 1), "%)")
+pc2_lab <- paste0("PC2 (", round(100 * pve[2], 1), "%)")
+pc3_lab <- paste0("PC3 (", round(100 * pve[3], 1), "%)")
+
+df <- data.frame(
+  sample = colnames(vsd_phen),
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2],
+  PC3 = pca$x[,3],
+  Treatment = sampleinfo_Phen$Treatment,
+  Day = sampleinfo_Phen$Day
+)
+
+df$Treatment <- factor(df$Treatment)
+df$Day <- factor(df$Day)
+
+# ----------------------------
+# PCA plot
+# ----------------------------
+pc_p <- ggplot(df, aes(PC1, PC2, color = Treatment, shape = Day)) +
+  geom_point(size = 5) +
+  theme_minimal(base_size = 16) +
+  
+  labs(
+    title = "PCA: Phenserine",
+    x = pc1_lab,
+    y = pc2_lab
+  )
+
+ggsave(
+  filename = file.path(
+    "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/Early",
+    "PCA_Phenserine_Early.pdf"
+  ),
+  plot = pc_p,
+  width = 6,
+  height = 5
+)
+
+```
+
+```{r}
+#######################################
+# GENE SET ENRICHMENT ANALYSIS - FGSEA
+#######################################
+
+dir.create("FGSEA", showWarnings = FALSE)
+
+my_FGSEA <- function(mypath, organism = c("HUMAN", "MOUSE", "RAT"),
+                     database = c("GO", "KEGG", "REACTOME"),
+                     myresultspath) {
+  library(tibble)
+  library(fgsea)
+  library(msigdbr)
+  library(KEGGREST)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(org.Mm.eg.db)
+  library(org.Rn.eg.db)
+  library(dplyr)
+  
+  # Select species
+  msig_species <- switch(organism,
+                         "HUMAN" = "Homo sapiens",
+                         "MOUSE" = "Mus musculus",
+                         "RAT"   = "Rattus norvegicus")
+  
+  # For KEGGREST, map to KEGG organism codes
+  kegg_code <- switch(organism,
+                      "HUMAN" = "hsa",
+                      "MOUSE" = "mmu",
+                      "RAT"   = "rno")
+  
+  # Pick OrgDb for symbol → Entrez mapping
+  OrgDb <- switch(organism,
+                  "HUMAN" = org.Hs.eg.db,
+                  "MOUSE" = org.Mm.eg.db,
+                  "RAT"   = org.Rn.eg.db)
+  
+  # Get gene sets
+  if (database == "GO") {
+    gs <- msigdbr(species = msig_species, collection = "C5", subcollection = "GO:BP")
+    pathway_list <- gs %>%
+      dplyr::select(gs_name, gene_symbol) %>%
+      group_by(gs_name) %>%
+      summarise(genes = list(gene_symbol), .groups = "drop") %>%
+      deframe()
+    
+  } else if (database == "REACTOME") {
+    gs <- msigdbr(species = msig_species, collection = "C2", subcollection = "CP:REACTOME")
+    pathway_list <- gs %>%
+      dplyr::select(gs_name, gene_symbol) %>%
+      group_by(gs_name) %>%
+      summarise(genes = list(gene_symbol), .groups = "drop") %>%
+      deframe()
+    
+  } else if (database == "KEGG") {
+    message("Fetching dynamic KEGG pathways via KEGGREST...")
+    pathways <- keggList("pathway", kegg_code)
+    pathway_ids <- names(pathways)
+    
+    pathway_list <- lapply(pathway_ids, function(pid) {
+      genes <- keggGet(pid)[[1]]$GENE
+      if (!is.null(genes)) {
+        # KEGG returns: c("geneid1","desc1","geneid2","desc2",...)
+        entrez_ids <- genes[seq(1, length(genes), 2)]
+        return(entrez_ids)
+      } else {
+        return(NULL)
+      }
+    })
+    names(pathway_list) <- pathways
+  }
+  
+  #  Get list of DEG files
+  file.names <- dir(mypath, pattern = "DEG_")[!grepl("sig", dir(mypath, pattern = "DEG_"), ignore.case = TRUE)]
+  
+  for (i in seq_along(file.names)) {
+    message("Processing file: ", file.names[i])
+    res <- read.table(file = file.path(mypath, file.names[i]), header = TRUE, sep = ",")
+    
+    if (!"gene_symbol" %in% colnames(res)) {
+      stop("Column 'gene_symbol' not found in ", file.names[i])
+    }
+    
+    # Select ranking column
+    if ("stat" %in% colnames(res)) {
+      res$rank_stat <- res$stat
+    } else if ("log2FoldChange_shrunk" %in% colnames(res)) {
+      res$rank_stat <- res$log2FoldChange_shrunk
+    } else if ("log2FoldChange" %in% colnames(res)) {
+      res$rank_stat <- res$log2FoldChange
+    } else {
+      stop("No ranking column found.")
+    }
+    
+    # Prepare ranks
+    ranks_df <- res %>%
+      filter(!is.na(gene_symbol)) %>%
+      filter(!is.na(rank_stat)) %>%
+      distinct(gene_symbol, .keep_all = TRUE) %>%
+      arrange(desc(rank_stat))
+    
+    ranks <- ranks_df$rank_stat
+    names(ranks) <- ranks_df$gene_symbol
+    
+    # If KEGG → convert to Entrez IDs
+    if (database == "KEGG") {
+      idmap <- AnnotationDbi::select(OrgDb,
+                                     keys = names(ranks),
+                                     columns = c("ENTREZID"),
+                                     keytype = "SYMBOL")
+      idmap <- idmap[!is.na(idmap$ENTREZID), ]
+      
+      ranks <- ranks[idmap$SYMBOL]
+      names(ranks) <- idmap$ENTREZID
+    }
+    
+    # Run fgsea
+    fgsea_res <- fgsea(pathways = pathway_list,
+                       stats = ranks,
+                       minSize = 15,
+                       maxSize = 500)
+    
+    # Save results
+    out_file <- file.path(myresultspath,
+                          paste0(sub("DEG_", "", file.names[i]), "_FGSEA_", database, ".csv"))
+    
+    fgsea_res_to_save <- fgsea_res %>%
+      mutate(leadingEdge = sapply(leadingEdge, function(x) paste(x, collapse = ";")))
+    
+    write.csv(fgsea_res_to_save, out_file, row.names = FALSE)
+    message("Saved FGSEA results to: ", out_file)
+  }
+  
+  message("FGSEA analysis complete for all files in folder: ", myresultspath)
+}
+
+
+# Run
+mypath <- "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/DEG_results"
+myresultspath <- "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/FGSEA"
+
+for (database in c("KEGG", "REACTOME", "GO")) {
+  my_FGSEA(mypath, "HUMAN", database, myresultspath)
+}
+
+
+```
+
+```{r}
+#######################################
+#  TF Activities (updated to collecTRI)
+#######################################
+
+library(viper)
+library(purrr)
+library(dplyr)
+library(tibble)
+library(biomaRt)
+library(tidyr)
+library(OmnipathR)
+library(decoupleR)
+
+# Main TF activity function
+
+my_TFA <- function(mypath, organism = c("human", "mouse", "rat")) {
+  organism <- match.arg(organism)
+  outfolder <- file.path(getwd(), "TF_Activities")
+  dir.create(outfolder, showWarnings = FALSE)
+  
+ 
+Regulon_file <- get_collectri(
+  organism = organism,
+  split_complexes = FALSE
+
+)
+  df2regulon_simple <- function(df) {
+  
+  stopifnot(all(c("source", "target", "mor") %in% colnames(df)))
+  
+  df <- df %>%
+    filter(!is.na(source), !is.na(target), !is.na(mor)) %>%
+    filter(mor %in% c(-1, 1)) %>%
+    distinct(source, target, .keep_all = TRUE)
+  
+  split(df, df$source) %>%
+    purrr::map(function(dat) {
+      list(
+        tfmode = setNames(dat$mor, dat$target),
+        likelihood = setNames(rep(1, nrow(dat)), dat$target)
+      )
+    })
+}
+
+    regulon_list <- df2regulon_simple(Regulon_file)
+  
+  file.names <- dir(mypath, pattern = "DEG_")[!grepl("sig", dir(mypath, pattern = "DEG_"), ignore.case = TRUE)]
+  
+  for (i in seq_along(file.names)) {
+    message("Processing file: ", file.names[i])
+    
+    DEsignature <- read.table(file = file.path(mypath, file.names[i]), header = TRUE, sep = ",")
+    
+    if (!"gene_symbol" %in% colnames(DEsignature)) {
+      stop("Column 'gene_symbol' not found in ", file.names[i])
+    }
+    
+    DEsignature <- DEsignature %>%
+      filter(!is.na(gene_symbol) & gene_symbol != "") %>%
+      distinct(gene_symbol, .keep_all = TRUE)
+    
+    if (!("padj" %in% colnames(DEsignature) && "stat" %in% colnames(DEsignature))) {
+      stop("Columns 'padj' and/or 'stat' not found in ", file.names[i])
+    }
+    
+    myStatistics <- matrix(DEsignature$stat,
+                           dimnames = list(DEsignature$gene_symbol, 'stat'))
+    myPvalue <- matrix(DEsignature$padj,
+                       dimnames = list(DEsignature$gene_symbol, 'padj'))
+    
+   
+    mySignature <- DEsignature$stat
+    names(mySignature) <- DEsignature$gene_symbol
+    mySignature <- sort(mySignature, decreasing = TRUE)
+
+    
+    # Estimate TF activities using regulon
+  
+    mrs <- msviper(ges = mySignature, regulon = regulon_list, ges.filter = FALSE, minsize = 5)
+    
+    TF_activities <- data.frame(
+      Regulon = names(mrs$es$nes),
+      Size = mrs$es$size[names(mrs$es$nes)],
+      NES = mrs$es$nes,
+      p.value = mrs$es$p.value,
+      FDR = p.adjust(mrs$es$p.value, method = 'fdr')
+    )
+    
+    TF_activities <- TF_activities[order(TF_activities$p.value), ]
+    
+    out_file <- file.path(outfolder, paste0(file.names[i], "_TFAs", ".csv"))
+    write.csv(TF_activities, file = out_file, row.names = FALSE)
+    message("Saved TF activity results to: ", out_file)
+  }
+  
+  message("TF activity analysis complete for all files in: ", outfolder)
+}
+
+
+options(timeout = 300)
+mypath <- "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/DEG_results"
+my_TFA(mypath, "human")
+
+```
+
+
+```{r}
+
+## Plot TF ACTIVITY ##
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+plot_TFA_bubbles <- function(mypath, top_n = 20, use_fdr = FALSE) {
+  
+  outfolder <- file.path(getwd(), "TFA_BubblePlots")
+  dir.create(outfolder, showWarnings = FALSE, recursive = TRUE)
+  
+  file.names <- list.files(
+    mypath,
+    pattern = "TFAs.csv$",
+    full.names = TRUE
+  )
+  
+  for (f in file.names) {
+    
+    message("Processing: ", basename(f))
+    
+    df <- readr::read_csv(f, show_col_types = FALSE)
+    
+    stopifnot(all(c("Regulon", "NES") %in% colnames(df)))
+    
+    sig_col <- if (use_fdr && "FDR" %in% colnames(df)) {
+      "FDR"
+    } else if ("p.value" %in% colnames(df)) {
+      "p.value"
+    } else if ("FDR" %in% colnames(df)) {
+      "FDR"
+    } else {
+      stop("No 'p.value' or 'FDR' column found in ", basename(f))
+    }
+    
+    df2 <- df %>%
+      dplyr::filter(!is.na(Regulon), !is.na(NES), !is.na(.data[[sig_col]])) %>%
+      dplyr::mutate(
+        sig_value = pmax(.data[[sig_col]], 1e-300),   # avoid -Inf
+        log_sig = -log10(sig_value)
+      ) %>%
+      dplyr::arrange(sig_value, dplyr::desc(abs(NES))) %>%
+      dplyr::slice_head(n = top_n) %>%
+      dplyr::mutate(
+        Regulon = forcats::fct_reorder(Regulon, NES)
+      )
+    
+    p <- ggplot(df2, aes(x = NES, y = Regulon)) +
+      geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+      geom_point(aes(size = log_sig, colour = NES), alpha = 0.85) +
+      scale_colour_gradient2(
+        low = "navy",    # blue
+        mid = "white",
+        high = "maroon",   # red
+        midpoint = 0,
+        name = "NES"
+      ) +
+      scale_size_continuous(name = paste0("-log10(", sig_col, ")")) +
+      scale_x_continuous(expand = expansion(mult = c(0.08, 0.08))) +
+      labs(
+        title = paste0("Top ", top_n, " TF activities: ", tools::file_path_sans_ext(basename(f))),
+        x = "NES",
+        y = NULL
+      ) +
+      theme_bw(base_size = 12) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 10),
+        panel.grid.major.y = element_line(colour = "grey92"),
+        panel.grid.minor = element_blank()
+      )
+    
+    out_pdf <- file.path(
+      outfolder,
+      paste0(tools::file_path_sans_ext(basename(f)), "_bubbleplot_top", top_n, ".pdf")
+    )
+    
+    out_png <- file.path(
+      outfolder,
+      paste0(tools::file_path_sans_ext(basename(f)), "_bubbleplot_top", top_n, ".png")
+    )
+    
+    ggsave(out_pdf, p, width = 4, height = 6)
+    ggsave(out_png, p, width = 4, height = 6, dpi = 300)
+  }
+  
+  message("Done. Bubble plots saved in: ", outfolder)
+}
+
+
+mypath <- "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/TF_Activities"
+plot_TFA_bubbles(mypath, top_n = 20, use_fdr = FALSE)
+
+
+
+```
+
+
+```{r}
+
+## Plot FGSEA - top upregulated ##
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+plot_FGSEA_bubbles <- function(mypath, top_n = 10, use_fdr = FALSE) {
+  
+  outfolder <- file.path(getwd(), "FGSEA_BubblePlots")
+  dir.create(outfolder, showWarnings = FALSE, recursive = TRUE)
+  
+  file.names <- list.files(
+    mypath,
+    pattern = "KEGG.csv$",
+    full.names = TRUE
+  )
+  
+  for (f in file.names) {
+    
+    message("Processing: ", basename(f))
+    
+    df <- readr::read_csv(f, show_col_types = FALSE)
+    
+    stopifnot(all(c("pathway", "NES") %in% colnames(df)))
+    
+    sig_col <- if (use_fdr && "padj" %in% colnames(df)) {
+      "padj"
+    } else if ("pval" %in% colnames(df)) {
+      "pval"
+    } else {
+      stop("No 'p.value' or 'FDR' column found in ", basename(f))
+    }
+    
+    df2 <- df %>%
+      dplyr::filter(!is.na(pathway), !is.na(NES), !is.na(.data[[sig_col]])) %>%
+      dplyr::filter(NES > 0) %>%
+      dplyr::mutate(
+        sig_value = pmax(.data[[sig_col]], 1e-300),   # avoid -Inf
+        log_sig = -log10(sig_value)
+      ) %>%
+      dplyr::arrange(sig_value, dplyr::desc(NES)) %>%
+      dplyr::slice_head(n = top_n) %>%
+      dplyr::mutate(
+        pathway = forcats::fct_reorder(pathway, NES)
+      )
+    
+    p <- ggplot(df2, aes(x = NES, y = pathway)) +
+      geom_point(aes(size = log_sig, colour = NES), alpha = 0.85) +
+      scale_colour_gradient2(
+        low = "navy",    # blue
+        mid = "white",
+        high = "maroon",   # red
+        midpoint = 0,
+        name = "NES"
+      ) +
+      scale_size_continuous(name = paste0("-log10(", sig_col, ")")) +
+      scale_x_continuous(expand = expansion(mult = c(0.08, 0.08))) +
+      labs(
+        title = paste0("Top upregulated ", top_n, " KEGG pathways: ", tools::file_path_sans_ext(basename(f))),
+        x = "NES",
+        y = NULL
+      ) +
+      theme_bw(base_size = 12) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 10),
+        panel.grid.major.y = element_line(colour = "grey92"),
+        panel.grid.minor = element_blank()
+      )
+    
+    out_pdf <- file.path(
+      outfolder,
+      paste0(tools::file_path_sans_ext(basename(f)), "_bubbleplot_top", top_n, ".pdf")
+    )
+    
+    out_png <- file.path(
+      outfolder,
+      paste0(tools::file_path_sans_ext(basename(f)), "_bubbleplot_top", top_n, ".png")
+    )
+    
+    ggsave(out_pdf, p, width = 7, height = 6)
+    ggsave(out_png, p, width = 7, height = 6, dpi = 300)
+  }
+  
+  message("Done. Bubble plots saved in: ", outfolder)
+}
+
+
+mypath <- "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/FGSEA"
+plot_FGSEA_bubbles(mypath, top_n = 10, use_fdr = FALSE)
+
+
+
+```
+
+```{r}
+
+## Plot FGSEA - top downregulated ##
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+plot_FGSEA_bubbles <- function(mypath, top_n = 10, use_fdr = FALSE) {
+  
+  outfolder <- file.path(getwd(), "FGSEA_BubblePlots")
+  dir.create(outfolder, showWarnings = FALSE, recursive = TRUE)
+  
+  file.names <- list.files(
+    mypath,
+    pattern = "KEGG.csv$",
+    full.names = TRUE
+  )
+  
+  for (f in file.names) {
+    
+    message("Processing: ", basename(f))
+    
+    df <- readr::read_csv(f, show_col_types = FALSE)
+    
+    stopifnot(all(c("pathway", "NES") %in% colnames(df)))
+    
+    sig_col <- if (use_fdr && "padj" %in% colnames(df)) {
+      "padj"
+    } else if ("pval" %in% colnames(df)) {
+      "pval"
+    } else {
+      stop("No 'p.value' or 'FDR' column found in ", basename(f))
+    }
+    
+    df2 <- df %>%
+      dplyr::filter(!is.na(pathway), !is.na(NES), !is.na(.data[[sig_col]])) %>%
+      dplyr::filter(NES < 0) %>%
+      dplyr::mutate(
+        sig_value = pmax(.data[[sig_col]], 1e-300),   # avoid -Inf
+        log_sig = -log10(sig_value)
+      ) %>%
+      dplyr::arrange(sig_value, dplyr::desc(NES)) %>%
+      dplyr::slice_head(n = top_n) %>%
+      dplyr::mutate(
+        pathway = forcats::fct_reorder(pathway, NES)
+      )
+    
+    p <- ggplot(df2, aes(x = NES, y = pathway)) +
+      geom_point(aes(size = log_sig, colour = NES), alpha = 0.85) +
+      scale_colour_gradient2(
+        low = "navy",    # blue
+        mid = "white",
+        high = "maroon",   # red
+        midpoint = 0,
+        name = "NES"
+      ) +
+      scale_size_continuous(name = paste0("-log10(", sig_col, ")")) +
+      scale_x_continuous(expand = expansion(mult = c(0.08, 0.08))) +
+      labs(
+        title = paste0("Top downregulated ", top_n, " KEGG pathways: ", tools::file_path_sans_ext(basename(f))),
+        x = "NES",
+        y = NULL
+      ) +
+      theme_bw(base_size = 12) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 10),
+        panel.grid.major.y = element_line(colour = "grey92"),
+        panel.grid.minor = element_blank()
+      )
+    
+    out_pdf <- file.path(
+      outfolder,
+      paste0(tools::file_path_sans_ext(basename(f)), "_bubbleplot_down", top_n, ".pdf")
+    )
+    
+    out_png <- file.path(
+      outfolder,
+      paste0(tools::file_path_sans_ext(basename(f)), "_bubbleplot_down", top_n, ".png")
+    )
+    
+    ggsave(out_pdf, p, width = 7, height = 6)
+    ggsave(out_png, p, width = 7, height = 6, dpi = 300)
+  }
+  
+  message("Done. Bubble plots saved in: ", outfolder)
+}
+
+
+mypath <- "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/FGSEA"
+plot_FGSEA_bubbles(mypath, top_n = 10, use_fdr = FALSE)
+
+
+
+```
+
+```{r}
+library(tidyverse)
+library(pheatmap)
+
+outfolder <- file.path(getwd(), "Synergy")
+dir.create(outfolder, showWarnings = FALSE)
+
+# -----------------------------
+# Load TFA results from files
+# -----------------------------
+TFA_dir <- "TF_Activities"
+
+TFA_files <- list.files(
+  TFA_dir,
+  pattern = "(Sacubitril.csv_TFAs|Phenserine.csv_TFAs)\\.csv$",
+  full.names = TRUE
+)
+
+if (length(TFA_files) == 0) stop("No TFA results found in TF_Activities folder!")
+
+# Use filenames (without extension) as comparison names
+comparison_names <- basename(TFA_files) %>% str_remove(".csv_TFAs\\.csv$")
+
+# Read files with proper names as source_file
+TFA_all_df <- map2_dfr(
+  TFA_files,
+  comparison_names,
+  ~ read_csv(.x) %>% mutate(source_file = .y)
+)
+
+# -----------------------------
+# Identify significant TFs across all comparisons
+# -----------------------------
+sig_TFs <- TFA_all_df %>%
+  filter(!is.na(FDR), FDR < 0.05) %>%
+  distinct(Regulon) %>%
+  pull(Regulon)
+
+message("Number of TFs significant in at least one comparison: ", length(sig_TFs))
+
+if (length(sig_TFs) == 0) stop("No significant TFs to plot!")
+
+# -----------------------------
+# Build NES matrix including all TFs across comparisons
+# -----------------------------
+heatmap_mat <- TFA_all_df %>%
+  filter(Regulon %in% sig_TFs) %>%
+  dplyr::select(Regulon, source_file, NES) %>%
+  pivot_wider(names_from = source_file, values_from = NES)
+
+# Convert to matrix with rownames = TFs
+heatmap_mat <- heatmap_mat %>%
+  column_to_rownames("Regulon") %>%
+  as.matrix()
+
+# Replace NAs with 0 so clustering works
+heatmap_mat[is.na(heatmap_mat)] <- 0
+
+# -----------------------------
+# Plot heatmap
+# -----------------------------
+pheatmap_syn <- pheatmap(
+  heatmap_mat,
+  color = colorRampPalette(c("blue3", "white", "red4"))(50),
+  clustering_method = "complete",
+  fontsize_row = 10,
+  fontsize_col = 10,
+  main = "NES heatmap of significant TFs"
+)
+
+
+
+ggsave(
+  filename = file.path(
+    "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/Synergy",
+    "Heatmap_TFAs_Synergy.pdf"
+  ),
+  plot = pheatmap_syn$gtable,
+  width = 3,
+  height = 10
+)
+
+```
+
+
+```{r}
+library(tidyverse)
+library(pheatmap)
+
+# -----------------------------
+# Additive and PS genes
+# -----------------------------
+
+additive_genes <- all_res %>%
+  dplyr::filter(!is.na(class), class %in% c("additive", "PS_only")) %>%
+  dplyr::pull(symbol)
+additive_genes <- additive_genes[!is.na(additive_genes)]
+# -----------------------------
+# Build matrix from normalised counts
+# -----------------------------
+colnames(dds_syn) <- sampleinfo_syn$ID
+vsd_syn <- vst(dds_syn, blind = FALSE)
+normcts_syn <- assay(vsd_syn) %>%
+  as_tibble(rownames = "ensembl_id") %>%
+  mutate(
+    ensembl_lookup = sub("\\..*$", "", ensembl_id),
+    gene_symbol = gene_symbols[ensembl_lookup]
+  ) %>%
+  dplyr::select(gene_symbol, everything(), -ensembl_lookup)
+
+heatmap_mat_syn <- normcts_syn  %>%
+  filter(gene_symbol %in% additive_genes) %>%
+  dplyr::select(-ensembl_id)
+
+!any(duplicated(heatmap_mat_syn$gene_symbol))
+
+heatmap_mat_syn <- heatmap_mat_syn[-c(103),]
+
+heatmap_mat_syn <- heatmap_mat_syn %>%
+  column_to_rownames("gene_symbol")
+
+# Replace NAs with 0 so clustering works
+heatmap_mat_syn[is.na(heatmap_mat_syn)] <- 0
+
+# -----------------------------
+# Plot heatmap
+# -----------------------------
+pheatmap_syn <- pheatmap(
+ heatmap_mat_syn,
+  scale="row",
+  color = colorRampPalette(c("blue3", "white", "red4"))(50),
+  clustering_method = "complete",
+  fontsize_row = 10,
+  fontsize_col = 10,
+  main = "Heatmap of additive DEGs"
+)
+
+group <- colData(dds_syn)$Treatment
+heatmap_mat_syn_avg <- sapply(unique(group), function(g) {
+  rowMeans(heatmap_mat_syn[, group == g, drop = FALSE], na.rm = TRUE)
+})
+
+heatmap_mat_syn_avg <- as.matrix(heatmap_mat_syn_avg)
+colnames(heatmap_mat_syn_avg) <- unique(group)
+
+
+pheatmap_syn_avg <- pheatmap(
+  heatmap_mat_syn_avg,
+  scale="row",
+  color = colorRampPalette(c("blue3", "white", "red4"))(50),
+  clustering_method = "complete",
+  fontsize_row = 10,
+  fontsize_col = 10,
+  main = "Heatmap of additive DEGs (averaged)"
+)
+
+
+ggsave(
+  filename = file.path(
+    "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/Synergy",
+    "Heatmap_Synergy_additive_genes.pdf"
+  ),
+  plot = pheatmap_syn$gtable,
+  width = 3,
+  height = 10
+)
+
+ggsave(
+  filename = file.path(
+    "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/Synergy",
+    "Heatmap_Synergy_additive_genes_average.pdf"
+  ),
+  plot = pheatmap_syn_avg$gtable,
+  width = 3,
+  height = 10
+)
+
+```
+
+```{r cars}
+
+# -----------------------------
+# Overrepresentation analysis for supradditive genes
+# -----------------------------
+
+library(clusterProfiler)
+
+# Convert gene symbols to Entrez IDs
+  entrez_ids <- mapIds(org.Hs.eg.db, keys = additive_genes, column = "ENTREZID", keytype = "SYMBOL")
+  entrez_ids <- unlist(entrez_ids)
+  # Remove NA values
+  entrez_ids <- entrez_ids[!is.na(entrez_ids)]
+  
+  
+  # Perform KEGG enrichment analysis
+  KEGG_enrich <- enrichKEGG(gene = entrez_ids, 
+                          organism = "hsa",
+                          pAdjustMethod = "BH", 
+                          pvalueCutoff = 0.05, 
+                          qvalueCutoff = 0.2)
+  
+ # Convert the result to a data frame and add cluster information if not empty
+  KEGG_result <- as.data.frame(KEGG_enrich)
+  
+KEGG_additive_plot <- ggplot(KEGG_result, aes(x = reorder(Description, -log10(p.adjust)), y = p.adjust, fill = subcategory)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "KEGG enrichment for PS additive genes", x = "KEGG Term", y = "p.adjust") +
+  theme_minimal(base_size = 12)
+
+ggsave(
+  filename = file.path(
+    "~/Documents/SANGER/RESULTS/Phenserine/Bulk_RNA_seq/Analysis/Synergy",
+    "KEGG_Synergy_additive_genes.pdf"
+  ),
+  plot = KEGG_additive_plot,
+  width = 8,
+  height = 3
+)
+
+```
+
